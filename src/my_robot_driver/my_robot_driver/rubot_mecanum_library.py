@@ -1,6 +1,5 @@
 import pigpio
 import time as t
-import rospy
 from std_msgs.msg import Float32
 import math
 

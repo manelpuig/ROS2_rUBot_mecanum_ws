@@ -3,7 +3,7 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
-
+import math
 
 class RobotSelfControl(Node):
 
@@ -24,7 +24,6 @@ class RobotSelfControl(Node):
         self._strafeSpeed = self.get_parameter('strafe_speed').value
         self._rotationSpeed = self.get_parameter('rotation_speed').value
         self._time_to_stop = self.get_parameter('time_to_stop').value
-        self._movement_state = "FORWARD"
 
         self._msg = Twist()
         self._msg.linear.x = self._forwardSpeed * self._speedFactor
@@ -69,90 +68,93 @@ class RobotSelfControl(Node):
         if self._shutting_down:
             return
 
-        angle_min_deg = scan.angle_min * 180.0 / 3.14159
-        angle_increment_deg = scan.angle_increment * 180.0 / 3.14159
+        angle_min_deg = scan.angle_min * 180.0 / math.pi
+        angle_inc_deg = scan.angle_increment * 180.0 / math.pi
 
-        # Filter valid readings within [-150°, 150°]
-        custom_range = [
-            (distance, i) for i, distance in enumerate(scan.ranges)
-            if scan.range_min < distance < scan.range_max
-            and -150 <= (angle_min_deg + i * angle_increment_deg) <= 150
-        ]
+        # Inicializamos distancias por zonas
+        zones = {
+            "FRONT": [],
+            "FRONT_LEFT": [],
+            "FRONT_RIGHT": [],
+            "LEFT": [],
+            "RIGHT": [],
+            "BACK_LEFT": [],
+            "BACK_RIGHT": [],
+            "BACK": []
+        }
 
-        if not custom_range:
-            return
+        # Clasificación de todos los puntos
+        for i, dist in enumerate(scan.ranges):
+            angle_deg = angle_min_deg + i * angle_inc_deg
+            if angle_deg > 180:
+                angle_deg -= 360
 
-        closest_distance, element_index = min(custom_range)
-        angle_closest_deg = angle_min_deg + element_index * angle_increment_deg
+            if not math.isfinite(dist) or dist <= 0.0:
+                continue
+            if dist < scan.range_min or dist > scan.range_max:
+                continue
 
-        if closest_distance < self._distanceLaser:
-            # Determine zone
-            if -45 <= angle_closest_deg <= 45:
-                zone = "FRONT"
-            elif 45 < angle_closest_deg <= 110:
-                zone = "LEFT"
-            elif -110 <= angle_closest_deg < -45:
-                zone = "RIGHT"
-            elif 110 < angle_closest_deg <= 150:
-                zone = "BACK_LEFT"
-            elif -150 <= angle_closest_deg < -110:
-                zone = "BACK_RIGHT"
+            # Define the zones by angles
+            if -30 <= angle_deg <= 30:
+                zones["FRONT"].append(dist)
+            elif -60 < angle_deg <= -30:
+                zones["FRONT_RIGHT"].append(dist)
+            elif -120 < angle_deg <= -60:
+                zones["RIGHT"].append(dist)
+            elif -150 < angle_deg <= -120:
+                zones["BACK_RIGHT"].append(dist)
+            elif 30 < angle_deg <= 60:
+                zones["FRONT_LEFT"].append(dist)
+            elif 60 < angle_deg <= 120:
+                zones["LEFT"].append(dist)
+            elif 120 < angle_deg <= 150:
+                zones["BACK_LEFT"].append(dist)
             else:
-                zone = "OUTSIDE FOV"
+                zones["BACK"].append(dist)
 
-            now = self.get_clock().now().seconds_nanoseconds()[0]
-            if now - self._last_info_time >= 1:
-                self.get_logger().info(f"[DETECTION] Closest object at {closest_distance:.2f} m | Angle: {angle_closest_deg:.1f}° | Zone: {zone}")
-                self._last_info_time = now
-        
-        # STATE DECISION LOGIC
-        
-            if zone == "FRONT":
-                self._movement_state = 'BACKWARD'
-            elif zone == "BACK_LEFT" or zone == "BACK_RIGHT":
-                self._movement_state = 'FORWARD'
-            elif zone == "LEFT":
-                self._movement_state = 'STRAFE_RIGHT'
-            elif zone == "RIGHT":
-                self._movement_state = 'STRAFE_LEFT'
-        # For OUTSIDE_FOV or BACK obstacles that are not critical, keep current state
-        else:
-            # No obstacle 
-            if self._movement_state not in ['BACKWARD', 'STRAFE_LEFT', 'STRAFE_RIGHT']:
-                self._movement_state = 'FORWARD'
+        # Tomamos la distancia mínima en cada zona
+        zone_min = {
+            z: min(dist_list) if dist_list else 999.0   # Si no hay lecturas, asumimos que está despejado
+            for z, dist_list in zones.items()
+        }
 
-        # --------------------------
-        # APPLY MOVEMENT STATE
-        # --------------------------
-        self._msg.linear.x = 0.0
-        self._msg.linear.y = 0.0
-        self._msg.angular.z = 0.0
-
-        if self._movement_state == 'FORWARD':
+        # Si el frente está despejado → avanzamos
+        if zone_min["FRONT"] > self._distanceLaser:
             self._msg.linear.x = self._forwardSpeed * self._speedFactor
             self._msg.linear.y = 0.0
             self._msg.angular.z = 0.0
-        elif self._movement_state == 'BACKWARD':
-            self._msg.linear.x = -self._forwardSpeed * self._speedFactor
-            self._msg.linear.y = 0.0
-            self._msg.angular.z = -self._rotationSpeed * self._speedFactor
-        elif self._movement_state == 'STRAFE_LEFT':
-            self._msg.linear.y = self._strafeSpeed * self._speedFactor
-            self._msg.linear.x = 0.0
-            self._msg.angular.z = 0.0
-            if closest_distance > 0.5:
-                self._msg.linear.x = self._forwardSpeed * self._speedFactor
-                self._msg.linear.y = 0.0
-                self._msg.angular.z = 0.0
+            return
 
-        elif self._movement_state == 'STRAFE_RIGHT':
-            self._msg.linear.y = -self._strafeSpeed * self._speedFactor
+        # ------------------------------------------------------
+        #   ELECCIÓN: mover hacia la zona MÁS DESPEJADA
+        # ------------------------------------------------------
+        best_zone = max(zone_min, key=zone_min.get)  # zona con mayor distancia mínima
+
+        # Reacción según la zona más libre
+        if best_zone == "LEFT":
             self._msg.linear.x = 0.0
-            self._msg.angular.z = 0.0
-            if closest_distance > 0.5:
-                self._msg.linear.x = self._forwardSpeed * self._speedFactor
-                self._msg.linear.y = 0.0
-                self._msg.angular.z = 0.0
+            self._msg.linear.y = self._strafeSpeed
+            self._msg.angular.z = 0.2
+
+        elif best_zone == "RIGHT":
+            self._msg.linear.x = 0.0
+            self._msg.linear.y = -self._strafeSpeed
+            self._msg.angular.z = -0.2
+
+        elif best_zone in ["FRONT_LEFT", "BACK_LEFT"]:
+            self._msg.linear.x = 0.0
+            self._msg.linear.y = self._strafeSpeed
+            self._msg.angular.z = 0.2
+
+        elif best_zone in ["FRONT_RIGHT", "BACK_RIGHT"]:
+            self._msg.linear.x = 0.0
+            self._msg.linear.y = -self._strafeSpeed
+            self._msg.angular.z = -0.2
+
+        elif best_zone == "BACK":
+            self._msg.linear.x = -self._forwardSpeed
+            self._msg.linear.y = 0.0
+            self._msg.angular.z = 0.2
 
     def stop(self):
         self._shutting_down = True

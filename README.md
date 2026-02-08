@@ -1,5 +1,3 @@
 # ROS2_rUBot_mecanum
 
-In this ROS2 repository we design, simulate and control different robots:
-- custom rUBot mecanum robot
-- Limo commercial robot
+This project is not maintained and has been mooved to `my_rUBot_mecanum` project to take into account Humble and Jazzy ROS2 versions
